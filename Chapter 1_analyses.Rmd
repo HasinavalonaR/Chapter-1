@@ -1,0 +1,1358 @@
+---
+title: "Chapter_1_analyses"
+author: "Hasinavalona Rakotoarisoa"
+date: "2026-03-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+How lemur species move in the same forest, how they use the same places, and whether they share, avoid, or separate from each other in space and time.
+
+# Packages
+
+```{r}
+# for data handling
+library(dplyr)
+library(lubridate)
+
+# for movement analyses
+library(geosphere)
+library(amt)
+library(adehabitatLT)
+library(momentuHMM)
+library(bcpa)
+library(changepoint)
+library(fitdistrplus)
+library(poweRlaw)
+library(dbscan)
+library(sf)
+
+# for analyses
+library(Matrix)
+library(lme4)
+library(glmmTMB)
+library(DHARMa)
+
+# for plot
+  library(ggplot2)
+```
+
+# Import data
+We have behavior data and lemur follow data from 2022 to 2025
+
+```{r}
+BHV <- read.csv("Lemur_Behavior.csv", header = TRUE)
+FLW <-read.csv("Follow.csv", header = TRUE)
+```
+
+# Prepare data
+
+This will fixe some GPS points that might have error like MN or NR or TR having different GPS so that they should have same points for same GPS ID
+
+```{r}
+df_BHV <- BHV %>%
+  group_by(GPS) %>%
+  mutate(
+    latitude_fix = if (substr(GPS[1], 1, 2) %in% c("MN", "NR", "TR")) first(latitude) else latitude,
+    longitude_fix = if (substr(GPS[1], 1, 2) %in% c("MN", "NR", "TR")) first(longitude) else longitude
+  ) %>%
+  ungroup()
+```
+
+Now this will be the data I am gonna use for the analyses
+
+```{r}
+df_BHV <- df_BHV %>%
+  mutate(
+    latitude = latitude_fix,
+    longitude = longitude_fix
+  ) %>%
+  dplyr::select(-latitude_fix, -longitude_fix)
+```
+
+**Make sure date and time are in a good format**
+Here I remove value like "NULL" and extra space if there are and then standardize time format
+
+Remove invalide value
+
+```{r}
+df_BHV <- df_BHV %>%
+  filter(Time != "NULL",
+         !is.na(Time))
+
+# remove extra space
+df_BHV$Time <- trimws(df_BHV$Time)
+```
+
+```{r}
+df_FLW <- FLW %>%
+  filter(Time != "NULL",
+         !is.na(Time))
+
+# remove extra space
+df_FLW$Time <- trimws(df_FLW$Time)
+```
+
+standardize time format since Time is missing seconds
+
+```{r}
+df_BHV <- df_BHV %>%
+  mutate(
+    Time = ifelse(grepl("^\\d{1,2}:\\d{2}$", Time),
+                  paste0(Time, ":00"),
+                  Time)
+  )
+```
+
+```{r}
+df_FLW <- df_FLW %>%
+  mutate(
+    Time = ifelse(grepl("^\\d{1,2}:\\d{2}$", Time),
+                  paste0(Time, ":00"),
+                  Time)
+  )
+```
+
+Convert to good format date and time
+
+```{r}
+df_BHV <- df_BHV %>%
+  mutate(
+    date = dmy(date),
+    Time = hms(Time),
+    datetime = as.POSIXct(date + Time)
+  )
+```
+
+```{r}
+df_FLW <- df_FLW %>%
+  mutate(
+    date = dmy(date),
+    Time = hms(Time),
+    datetime = as.POSIXct(date + Time)
+  )
+```
+
+## Clean dataset
+**Remove rows where GPS is missing**
+This is very important if I want to calculate correctly my movement metrics because I cannot calculate movement without coordinates.
+And since movement is always calculate calculated between previous point with the next point so I had to rearrange my data in correct order i.e. by unique code and by time to avoid nonsense movement distances (hoe @ 12 daty androany lasa linked @ 08 maraina daty rahampitso ohatra) ---------- nampihena ny data aloha ito
+
+```{r}
+df_BHV_clean <- df_BHV %>%
+  filter(!is.na(latitude),
+         !is.na(longitude)) %>%
+  arrange(unique_code, datetime)
+```
+
+```{r}
+df_FLW_clean <- df_FLW %>%
+  filter(!is.na(latitude),
+         !is.na(longitude)) %>%
+  arrange(unique_code, datetime)
+```
+
+**Combine the two data**
+
+```{r}
+BHV_FLW <- df_BHV_clean %>%
+  left_join(df_FLW_clean,
+            by = "unique_code","datetime")
+```
+
+
+# Objective 1: Quantify movement patterns (individual, species, seasonal variation)
+This objective quantify patterns and describe how lemurs move, including how far, how fast, and in which directions they travel
+
+I use metric-based analyses
+
+## Calculate movement metrics for each individual/species and day
+Here I calculate movement per lemur followed i.e. Individual × date × group_day since in one day we might follow two different individual because we lost the first one
+
+**Create a track file**
+with the dataset and specify the Coordinate Reference System (CRS). CRS is the coordinate reference system. We used WGS84 because it is commonly used, but then we transfomed the projection to use one specific for Madagascar.
+
+```{r}
+trck.all.2 <- make_track(df_BHV_clean,
+                         longitude, latitude,
+                         species = species,
+                         Sex = Sex,
+                         Ind_ID = Ind_ID,
+                         group_day = group_day,
+                         date = date,
+                         Time = Time,
+                         datetime = datetime,
+                         activity = Activity_1,
+                         crs = 4326)
+
+# Create a new column time_2 by adding 24 hours to entries before 6 AM
+trck.all.2$time_2 <- dplyr::if_else(lubridate::hour(trck.all.2$Time) < 6,
+                                lubridate::hour(trck.all.2$Time) + 24,
+                                lubridate::hour(trck.all.2$Time))
+```
+
+Transform coordinates using a projected CRS, UTM38S for Madagascar (https://epsg.io/29738). So the distances are calculated in meters
+
+```{r}
+trck.all.2 <- transform_coords(trck.all.2, 29738)
+```
+
+### Daily movement patterns
+**Step length, speed, daily path legnth, turning angles and straightness**
+Observations with fewer points than three will be ignored as movement cannot be calculated.
+
+This loops over every individual, then for each individual it loops over each day, and within each day it loops over each group_day. For each group_day, it selects the corresponding GPS points, orders them by time.
+
+This calculates the **step lengths = distance between consecutive points using x and y coordinates**, the time differences between those points, and uses these to calculate **speed = distance divided by time**.
+It also sums all **step lengths to get the total distance traveled** based on the group_day.
+
+This also calculates **turning angles by measuring changes in movement direction between steps** (fa natao mean turning angle). We also calculate **straightness, which compares the straight-line distance between the first and last location to the total path length** = how straight the path is (0 = very tortuous, 1 = perfectly straight). 
+
+Maybe add first passage time??????? mbola tsy nataoko aloha
+
+Results are for each individual, species, date, and group_day
+
+```{r}
+# Get all unique individual
+Individual_list <- unique(trck.all.2$Ind_ID)
+```
+
+```{r}
+# Output storage
+dpl.lem <- list()
+
+# Run loop
+individual_list <- unique(trck.all.2$Ind_ID)
+
+for (i in individual_list) {
+  
+  lem <- trck.all.2 %>% filter(Ind_ID == i) # Select only data for an individual
+  date_list <- unique(lem$date) # Get all dates where this individual was observed
+  
+  for (d in date_list) {
+    
+    lem_d <- lem %>% filter(date == d) # Keep only a specific day
+    group_list <- unique(lem_d$group_day) # Identify groups followed that day
+    
+    for (g in group_list) {
+      
+      tr <- lem_d %>% filter(group_day == g) %>% arrange(datetime)
+      
+      # skip if fewer tahn 3 points (satria mila at least 2 steps and 3 points ho an'ny turning angle)
+      if (nrow(tr) < 3) next
+      
+      # Step length (meters)
+      dx <- diff(tr$x_)
+      dy <- diff(tr$y_)
+      step <- sqrt(dx^2 + dy^2)
+      
+      # Time difference (hours)
+      dt <- as.numeric(diff(tr$datetime), units = "secs")
+      dt[dt == 0] <- NA # Avoid division by zero (ito tsy mety indrindra ho an'ny speed)
+      
+      # Speed (m/s)
+      speed <- step / dt
+      
+      # Daily path length
+      dpl <- sum(step, na.rm = TRUE)
+      
+      # Duration (hours)
+      duration_h <- as.numeric(difftime(max(tr$datetime),
+                                       min(tr$datetime),
+                                       units = "hours"))
+      
+      if (duration_h == 0) next # Skip if duration is zero
+      
+      dpl_per_hour <- dpl / duration_h # meters per hour
+      
+      # Turning angle
+      if (length(step) > 1) {
+        
+        angles <- atan2(dy, dx)
+        turning <- diff(angles)
+        
+      # Normalize angle
+        turning <- atan2(sin(turning), cos(turning))
+        
+        mean_turning <- mean(abs(turning), na.rm = TRUE)
+        
+      } else {
+        mean_turning <- NA
+      }
+      
+      # Net displacement = lemur distance from A to B (straight line) if Exploring / traveling far? dia high net displacement if Staying in one area? dia low net displacement
+      net_disp <- sqrt(
+        (tail(tr$x_, 1) - tr$x_[1])^2 +
+        (tail(tr$y_, 1) - tr$y_[1])^2
+      )
+      
+      # Straightness index (Distance from start → end)
+      straightness <- ifelse(dpl > 0, net_disp / dpl, NA)
+      
+      # Summaru output
+      res <- data.frame(
+        Ind_ID = i,
+        species = unique(tr$species),
+        date = d,
+        group_day = g,
+        n_points = nrow(tr),
+        
+        duration_h = duration_h,
+        
+        dpl_m = dpl,
+        dpl_per_hour = dpl_per_hour,
+        
+        mean_step = mean(step, na.rm = TRUE),
+        mean_speed = mean(speed, na.rm = TRUE),
+        
+        mean_turning = mean_turning,
+        straightness = straightness
+      )
+      
+      dpl.lem[[length(dpl.lem) + 1]] <- res
+    }
+  }
+}
+
+# Final data
+movement_metrics <- bind_rows(dpl.lem)
+
+# change the date back to "date format"
+movement_metrics$date <- as.Date(movement_metrics$date, origin = "1970-01-01")
+```
+
+Seasonal grouping: wet season (nov - apl), dry season (may - oct)
+
+```{r}
+movement_metrics$month <- lubridate::month(movement_metrics$date)
+
+movement_metrics$season <- ifelse(
+  movement_metrics$month %in% c(11,12,1,2,3,4),
+  "wet",
+  "dry"
+)
+```
+
+### Overall movement pattern
+This takes the movement results above and summarizes them at the individual, species and seasonal level
+
+**Individual summary**
+
+```{r}
+individual_summary <- movement_metrics %>%
+  dplyr::group_by(Ind_ID) %>%
+  dplyr::summarise(
+    n_follows = dplyr::n(),
+    mean_dpl = mean(dpl_m, na.rm = TRUE),
+    mean_step = mean(mean_step, na.rm = TRUE),
+    mean_speed = mean(mean_speed, na.rm = TRUE),
+    mean_turning = mean(mean_turning, na.rm = TRUE),
+    mean_straightness = mean(straightness, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(individual_summary)
+```
+
+**Species summary**
+
+```{r}
+species_summary <- movement_metrics %>%
+  dplyr::group_by(species) %>%
+  dplyr::summarise(
+    n_individuals = n_distinct(Ind_ID),
+    n_follows = n(),
+    mean_dpl = mean(dpl_m, na.rm = TRUE),
+    mean_step = mean(mean_step, na.rm = TRUE),
+    mean_speed = mean(mean_speed, na.rm = TRUE),
+    mean_turning = mean(mean_turning, na.rm = TRUE),
+    mean_straightness = mean(straightness, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+print(species_summary)
+```
+
+**Seasonal summary**
+
+```{r}
+season_summary <- movement_metrics %>%
+  dplyr::group_by(species, season) %>%
+  dplyr::summarise(
+    n_individuals = n_distinct(Ind_ID),
+    n_follows = n(),
+    mean_dpl = mean(dpl_m, na.rm = TRUE),
+    mean_step = mean(mean_step, na.rm = TRUE),
+    mean_speed = mean(mean_speed, na.rm = TRUE),
+    mean_turning = mean(mean_turning, na.rm = TRUE),
+    mean_straightness = mean(straightness, na.rm = TRUE),
+    
+    .groups = "drop"
+  )
+
+print(season_summary)
+```
+
+## Compare movement metrics: statistical analyses
+data not independent = one individual appears multiple times
+many measurement per individual
+
+Do individuals differ from each other in movement?
+Do species move differently?
+Does movement change between wet vs dry?
+
+I use linear mixed model to: test species differences, test seasonal effects and account for repeated observations per individual
+
+Before analyses I removed points less than 10 and duration less than 1 hour (tsy haiko hoe ca va ve zay sa mbola tokony manala betsaka) and remove unknown individuals (satria mitambatra ato daholo izay tsy fantatra)
+  
+```{r}
+movement_metrics_clean <- movement_metrics %>%
+  filter(n_points >= 10, duration_h >= 1)
+
+movement_metrics_clean <- movement_metrics_clean %>%
+  filter(!grepl("Unknown", Ind_ID))
+```
+
+#### Does step length change between individual, species and seasonal level?
+
+```{r}
+movement_metrics_clean$log_step <- log(movement_metrics_clean$mean_step + 1)
+```
+
+```{r}
+model_step <- glmmTMB(log_step ~ species * season + (1 | Ind_ID),
+                  data = movement_metrics_clean,
+                  family = gaussian())
+
+print(model_step)
+summary(model_step)
+
+res_step = simulateResiduals(model_step)
+plot(res_step)
+```
+
+#### Does speed change between individual, species and seasonal level?
+
+```{r}
+movement_metrics_clean$log_speed <- log(movement_metrics_clean$mean_speed + 1)
+```
+
+```{r}
+model_speed <- glmmTMB(log_speed ~ species * season + (1 | Ind_ID), family = tweedie(link = "log"),
+                  data = movement_metrics_clean)
+
+print(model_speed)
+summary(model_speed)
+
+res_speed = simulateResiduals(model_speed)
+plot(res_speed)
+```
+
+**Turning angles**
+
+```{r}
+movement_metrics_clean$log_turning <- log(movement_metrics_clean$mean_turning + 1)
+```
+
+```{r}
+model_angl <- glmmTMB(log_turning ~ species * season + (1 | Ind_ID), family = tweedie(link = "log"),
+                  data = movement_metrics_clean)
+
+print(model_angl)
+summary(model_angl)
+
+res_angl = simulateResiduals(model_angl)
+plot(res_angl)
+```
+
+**Daily path legth**
+
+```{r}
+movement_metrics_clean <- movement_metrics_clean %>%
+  filter(dpl_m >= 10)
+```
+
+```{r}
+model_dpl <- glmmTMB(
+  dpl_m ~ species * season + (1 | Ind_ID),
+  family = Gamma(link = "log"),
+  data = movement_metrics_clean
+)
+
+print(model_dpl)
+summary(model_dpl)
+
+res_dpl = simulateResiduals(model_dpl)
+plot(res_dpl)
+```
+
+**Straightness indices**
+
+```{r}
+n <- nrow(movement_metrics_clean)
+
+movement_metrics_clean$straightness_adj <- 
+  (movement_metrics_clean$straightness * (n - 1) + 0.5) / n
+```
+
+```{r}
+model_straight <- glmmTMB(
+  straightness_adj ~ species * season + (1 | Ind_ID), family = tweedie(link = "log"),
+  data = movement_metrics_clean
+)
+
+print(model_straight)
+summary(model_straight)
+
+res_straight = simulateResiduals(model_straight)
+plot(res_straight)
+```
+
+## Map GPS locations to visualize:
+
+Saika ho asiako map movement (where they move and where they overlap):Plot GPS points on a map, One map per species OR overlay species
+Mbola tsy nataoko aloha
+
+# Objective 2: Identify movement types & behavioral states (feeding, resting, traveling)
+Classify movement types (Brownian vs Lévy-like)
+Detect change points or transitions and identify behavioral states
+
+## Movement classification
+what type of movement are they doing?
+Brownian (random, short-step movements) or Lévy-like (long, directed movements)
+
+I classify movement using step length distribution
+
+**Preparing data**
+
+```{r}
+trck.all.2_argd <- trck.all.2 %>%
+  arrange(species, date, group_day, time_2)
+```
+
+```{r}
+trck.all.2_argd <- trck.all.2_argd %>%
+  group_by(Ind_ID) %>%
+  arrange(datetime) %>%
+  mutate(
+    dx = x_ - lag(x_),
+    dy = y_ - lag(y_),
+    step = sqrt(dx^2 + dy^2),
+    dt = as.numeric(difftime(datetime, lag(datetime), units = "secs")),
+    speed = step / dt
+  )
+```
+
+**Step length distribution: Brownian or Lévy-like**
+The parameter tell how steeply the tail declines: 
+smaller = heavier tail, more long steps,
+larger = lighter tail, fewer long steps.
+
+```{r}
+# Keep values greater than zero since zeros can cause problems
+step <- trck.all.2_argd %>%
+  filter(!is.na(step), step > 0) %>%
+  dplyr::select(species, Ind_ID, date, group_day, step)
+```
+
+### Compare by species
+Do lemur step lengths follow a short/random movement pattern (Brownian)?
+Do lemur step lengths follow a long/directed movement pattern (Lévy-like)?
+
+```{r}
+species_results <- step %>%
+  group_by(species) %>%
+  group_modify(~{
+    x <- .x$step
+    x <- x[x > 0]
+
+    fit_exp <- fitdist(x, "exp")
+    rate_hat <- fit_exp$estimate["rate"]
+    ll_exp <- sum(dexp(x, rate = rate_hat, log = TRUE))
+    aic_exp <- 2 * 1 - 2 * ll_exp
+
+    m <- conpl$new(x)
+    est <- estimate_xmin(m)
+    m$setXmin(est)
+    est_par <- estimate_pars(m)
+    ll_pl <- dist_ll(m)
+    aic_pl <- 2 * 1 - 2 * ll_pl
+
+    data.frame(
+      n_steps = length(x),
+      AIC_exponential = aic_exp,
+      AIC_powerlaw = aic_pl,
+      best_model = ifelse(aic_exp < aic_pl, "Brownian-like", "Lévy-like"),
+      xmin = m$getXmin(),
+      alpha = est_par$pars
+    )
+  }) %>%
+  ungroup()
+
+print(species_results)
+```
+
+### Compare by individual
+
+```{r}
+indiv_results <- step %>%
+  filter(step > 0) %>%
+  group_by(species, Individual) %>%
+  group_modify(~{
+    x <- .x$step
+    x <- x[is.finite(x) & x > 0]
+
+    if (length(x) < 20) return(data.frame(n_steps = length(x), best_model = NA))
+
+    fit_exp <- fitdist(x, "exp")
+    ll_exp <- sum(dexp(x, rate = fit_exp$estimate["rate"], log = TRUE))
+    aic_exp <- 2 * 1 - 2 * ll_exp
+
+    m <- conpl$new(x)
+    est <- estimate_xmin(m)
+    m$setXmin(est)
+    ll_pl <- dist_ll(m)
+    aic_pl <- 2 * 1 - 2 * ll_pl
+
+    data.frame(
+      n_steps = length(x),
+      AIC_exponential = aic_exp,
+      AIC_powerlaw = aic_pl,
+      best_model = ifelse(aic_exp < aic_pl, "Brownian-like", "Lévy-like")
+    )
+  }) %>%
+  ungroup()
+```
+
+```{r}
+print(indiv_results)
+```
+
+### Compare by season
+Season based on dates
+
+```{r}
+step_season <- step %>%
+  mutate(
+    date = as.Date(date),
+    month = lubridate::month(date),
+    season = dplyr::case_when(
+      month %in% c(11, 12, 1, 2, 3, 4) ~ "Wet",
+      month %in% c(5, 6, 7, 8, 9, 10) ~ "Dry",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+```{r}
+season_results <- step_season %>%
+  filter(step > 0, !is.na(season)) %>%
+  group_by(species, season) %>%
+  group_modify(~{
+    x <- .x$step
+    x <- x[is.finite(x) & x > 0]
+
+    if (length(x) < 20) {
+      return(data.frame(
+        n_steps = length(x),
+        AIC_exponential = NA,
+        AIC_powerlaw = NA,
+        best_model = NA,
+        xmin = NA,
+        alpha = NA
+      ))
+    }
+
+    fit_exp <- fitdistrplus::fitdist(x, "exp")
+    ll_exp <- sum(dexp(x, rate = fit_exp$estimate["rate"], log = TRUE))
+    aic_exp <- 2 * 1 - 2 * ll_exp
+
+    m <- poweRlaw::conpl$new(x)
+    est <- poweRlaw::estimate_xmin(m)
+    m$setXmin(est)
+    est_par <- poweRlaw::estimate_pars(m)
+    ll_pl <- poweRlaw::dist_ll(m)
+    aic_pl <- 2 * 1 - 2 * ll_pl
+
+    data.frame(
+      n_steps = length(x),
+      AIC_exponential = aic_exp,
+      AIC_powerlaw = aic_pl,
+      best_model = ifelse(aic_exp < aic_pl, "Brownian-like", "Lévy-like"),
+      xmin = m$getXmin(),
+      alpha = est_par$pars
+    )
+  }) %>%
+  ungroup()
+
+print(season_results)
+```
+
+## Change Point analyses
+Where does movement change? or when behavior changes
+
+This will use the the speed and turning angle variable for every single step
+
+bcpa package no nampiasaiko voalohany fa nisy erreur foana dia novaiko an'ito changepoints package (paper: Killick et al., (2014))
+
+**Prepare data**
+- atan2() calculates angle between consecutive positions
+- case_when() for season: biologically meaningful wet/dry dichotomy in Madagascar
+- even if I have calculated angle before here I calculates turning within individual daily tracks
+
+```{r}
+trck.all.2_argd <- trck.all.2_argd %>% ungroup()
+
+data_cp <- trck.all.2_argd %>%
+  ungroup() %>%
+  arrange(Ind_ID, date, group_day, time_2) %>%
+  mutate(month = month(date)) %>%
+  mutate(
+    season = case_when(
+      month %in% c(11, 12, 1, 2, 3, 4) ~ "Wet",
+      month %in% c(5, 6, 7, 8, 9, 10) ~ "Dry"
+    )
+  ) %>%
+  group_by(Ind_ID, date, group_day) %>%
+  mutate(
+    angle = atan2(dy, dx),
+    angle_change = c(NA, diff(angle)),
+    turning = atan2(sin(angle_change), cos(angle_change))
+  ) %>%
+  ungroup()
+```
+
+**Data cleaning: Remove invalide values**
+Here I remove impossible speed values (like negative speed or infinite speed)
+
+```{r}
+data_cp_clean <- data_cp %>%
+  filter(
+    is.finite(speed),
+    speed >= 0,
+    is.finite(turning)
+  )
+```
+
+### Calculate activity statistics
+Here I calculate average speed and turning for each activity code (F, M, T, R)
+
+The value from this calculation is based on actual observed behavior, not assumptions.
+I mean from our lemur species in our study-site
+
+```{r}
+activity_stats <- dplyr::summarise(
+  dplyr::group_by(data_cp_clean, species, activity),
+  n = dplyr::n(),
+  mean_speed = mean(speed, na.rm = TRUE),
+  sd_speed = sd(speed, na.rm = TRUE),
+  median_speed = median(speed, na.rm = TRUE),
+  q25_speed = quantile(speed, 0.25, na.rm = TRUE),
+  q75_speed = quantile(speed, 0.75, na.rm = TRUE),
+  mean_turning = mean(abs(turning), na.rm = TRUE),
+  sd_turning = sd(abs(turning), na.rm = TRUE),
+  median_turning = median(abs(turning), na.rm = TRUE),
+  q25_turning = quantile(abs(turning), 0.25, na.rm = TRUE),
+  q75_turning = quantile(abs(turning), 0.75, na.rm = TRUE),
+  .groups = "drop"
+) %>%
+  dplyr::arrange(median_speed)
+```
+
+**Filter key behavior**
+
+```{r}
+key_behaviors <- activity_stats %>%
+  dplyr::filter(activity %in% c("F", "M", "T", "R", "SL")) %>%
+  dplyr::select(activity, n, median_speed, median_turning)
+
+print(key_behaviors)
+```
+
+**Calculate R, F, M, T thresholds**
+Here we need to convert continuous movement metrics like speed and turning into classification thresholds.
+
+Goal: to create rules to classify behavior (thresholds) where I calculate specific speed and turning numbers that separate resting, feeding, moving and traveling
+
+So Resting threshold: Top 95% of resting speeds (covers most resting behavior). Turning threshold: Middle point between feeding and traveling turning
+
+```{r}
+# RESTING threshold: 95th percentile of Resting (R) speed
+resting_threshold <- data_cp_clean %>%
+  dplyr::filter(activity == "R") %>%
+  dplyr::summarise(thresh = quantile(speed, 0.95, na.rm = TRUE)) %>%
+  dplyr::pull(thresh)
+```
+
+```{r}
+# Compare feeding and traveling
+feeding_turning <- data_cp_clean %>%
+  dplyr::filter(activity == "F") %>%
+  dplyr::summarise(med = median(abs(turning), na.rm = TRUE)) %>%
+  dplyr::pull(med)
+
+traveling_turning <- data_cp_clean %>%
+  dplyr::filter(activity == "T") %>%
+  dplyr::summarise(med = median(abs(turning), na.rm = TRUE)) %>%
+  dplyr::pull(med)
+
+turning_threshold <- (feeding_turning + traveling_turning) / 2
+```
+
+```{r}
+# Compare feeding and moving
+moving_turning <- data_cp_clean %>%
+  dplyr::filter(activity == "M") %>%
+  dplyr::summarise(med = median(abs(turning), na.rm = TRUE)) %>%
+  dplyr::pull(med)
+```
+
+```{r}
+print("=== SUMMARY FOR METHODS/PAPER ===")
+print(paste("Feeding (F): n =", activity_stats %>% filter(activity == "F") %>% pull(n),
+            ", median speed =", round(activity_stats %>% filter(activity == "F") %>% pull(median_speed), 3), "m/s",
+            ", median turning =", round(feeding_turning, 3)))
+
+print(paste("Moving (M): n =", activity_stats %>% filter(activity == "M") %>% pull(n),
+            ", median speed =", round(activity_stats %>% filter(activity == "M") %>% pull(median_speed), 3), "m/s",
+            ", median turning =", round(activity_stats %>% filter(activity == "M") %>% pull(median_turning), 3)))
+
+print(paste("Traveling (T): n =", activity_stats %>% filter(activity == "T") %>% pull(n),
+            ", median speed =", round(activity_stats %>% filter(activity == "T") %>% pull(median_speed), 3), "m/s",
+            ", median turning =", round(traveling_turning, 3)))
+
+print(paste("Resting (R): n =", activity_stats %>% filter(activity == "R") %>% pull(n),
+            ", median speed =", round(activity_stats %>% filter(activity == "R") %>% pull(median_speed), 3), "m/s"))
+```
+Save
+
+```{r}
+write.csv(activity_stats, "output/activity_stats_full.csv", row.names = FALSE)
+write.csv(key_behaviors, "output/key_behaviors_summary.csv", row.names = FALSE)
+```
+
+### Change points analyses
+Here the goal is to find where behavior changes in the GPS points now. Lemurs often spend minutes doing the same thing, then switch. This finds the switch points.
+
+```{r}
+speed_ts <- data_cp_clean$speed
+speed_ts <- na.omit(speed_ts)
+speed_ts <- speed_ts[is.finite(speed_ts)]
+speed_ts <- speed_ts[speed_ts >= 0]
+```
+
+```{r}
+cp_speed <- cpt.mean(
+  speed_ts,
+  method = "PELT",
+  penalty = "MBIC"
+)
+
+plot(cp_speed)
+
+cpts(cp_speed)
+```
+
+Here the concept is to give each segment a number (1, 2, 3, etc.). It is gonna be like a reference (e.g. "Segment 1 = resting, Segment 2 = traveling"etc...)
+
+```{r}
+cpts_vec <- cpts(cp_speed)
+
+data_cp_clean$segment <- cut(
+  seq_along(data_cp_clean$speed),
+  breaks = c(0, cpts_vec, length(data_cp_clean$speed)),
+  labels = FALSE
+)
+```
+
+**Compute segment-level movement structure**
+this will separate the time series into distinct behavioral segments
+
+Here I calculate average movement for each segment = we classify the segment based on its average behavior,
+
+```{r}
+segments <- data_cp_clean %>%
+  dplyr::group_by(segment) %>%
+  dplyr::summarise(
+    mean_speed = mean(speed, na.rm = TRUE),
+    mean_step = mean(step, na.rm = TRUE),
+    mean_turning = mean(abs(turning), na.rm = TRUE),
+    median_speed = median(speed, na.rm = TRUE),
+    median_turning = median(abs(turning), na.rm = TRUE),  
+    n = dplyr::n(),
+    .groups = "drop"
+  )
+```
+
+**Classify behavior states**
+Now I classify each segment as resting, feeding, or traveling
+- Resting: very slow movement + almost no turning
+- Feeding: moving + low turning (eating in one area)
+- Traveling: moving + high turning (changing direction)
+
+```{r}
+segments <- segments %>%
+  dplyr::mutate(behavior = case_when(
+    mean_speed < resting_threshold & median_turning < 0.1 ~ "resting",
+    mean_speed >= resting_threshold & median_turning <= turning_threshold ~ "feeding",
+    mean_speed >= resting_threshold & median_turning > turning_threshold ~ "traveling",
+    TRUE ~ "unknown"
+  ))
+```
+
+Every GPS point now has a behavior label (resting/feeding/traveling)
+Now we can analyze behavior at any level: per individual, per species, per season, per location
+
+```{r}
+data_cp_clean <- data_cp_clean %>%
+  dplyr::left_join(
+    dplyr::select(segments, segment, behavior),
+    by = "segment"
+  )
+```
+
+### Figures
+
+```{r}
+p1 <- ggplot(data_cp_clean, aes(x = seq_along(speed), y = speed, color = behavior)) +
+  geom_line(alpha = 0.6) +
+  labs(
+    title = "What Are The Lemurs Doing?",
+    subtitle = paste(),
+    x = "Time",
+    y = "Speed (m/s)",
+    color = "Behavior"
+  ) +
+  theme_minimal()
+
+print(p1)
+```
+
+Behavior assigned to every GPS points
+
+```{r}
+table(data_cp_clean$behavior)
+
+plot(data_cp_clean$speed,
+     col = as.factor(data_cp_clean$behavior),
+     type = "l")
+```
+
+### Statistical test
+I first calaculate time budget per behavior and compare behaviors across groups
+
+**Proportion of time spent in different activities **
+How much time do lemurs spend resting vs feeding vs traveling?
+
+```{r}
+print(prop.table(table(data_cp_clean$behavior))*100)
+
+prop.table(table(data_cp_clean$species, data_cp_clean$behavior), margin = 1) * 100
+prop.table(table(data_cp_clean$season, data_cp_clean$behavior), margin = 1) * 100
+```
+```{r}
+behavior_by_species <- data_cp_clean %>%
+  dplyr::count(species, behavior, name = "n_points") %>%
+  dplyr::group_by(species) %>%
+  dplyr::mutate(
+    percent_time = round(n_points / sum(n_points) * 100, 1)
+  ) %>%
+  dplyr::ungroup()
+
+print(behavior_by_species)
+```
+
+I choose Chi-square tests to show if differences are significant
+
+**Do different lemurs behave differently?**
+
+```{r}
+indiv_table <- table(data_cp_clean$Ind_ID, data_cp_clean$behavior)
+```
+
+```{r}
+# I did the test with simulate p.value = TRUE since I got warning before
+indiv_test <- chisq.test(indiv_table, simulate.p.value = TRUE, B = 2000)
+print(indiv_test)
+```
+
+**Do different species have different behaviors?**
+
+```{r}
+species_table <- table(data_cp_clean$species, data_cp_clean$behavior)
+```
+
+```{r}
+species_test <- chisq.test(species_table)
+print(species_test)
+```
+
+**Do behaviors change between wet and dry season?**
+
+```{r}
+season_table <- table(data_cp_clean$season, data_cp_clean$behavior)
+```
+
+```{r}
+season_test <- chisq.test(season_table)
+print(season_test)
+```
+
+# Objective 3: Establish baseline spatial strategies & behavioral signatures
+
+This objective compare species together in the forest.
+Do species stay together in the same areas, or separate from each other in space or time?
+
+## Home range
+
+We decided to use KDE instead of MCP. 
+**KDE**: Kernel Density Estimation
+
+**Input preparation**
+
+Create a track file with the dataset and Specify the Coordinate Reference System (CRS). CRS is the coordinate reference system, I used WGS84 because it is commonly used, but then transfomed the projection to use one specific for Madagascar.
+
+```{r}
+df_BHV_clean <- df_BHV_clean %>%
+  mutate(month = month(date)) %>%
+  mutate(
+    season = case_when(
+      month %in% c(11, 12, 1, 2, 3, 4) ~ "Wet",
+      month %in% c(5, 6, 7, 8, 9, 10) ~ "Dry",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+
+```{r}
+trck.all <- make_track(df_BHV_clean, longitude, latitude, species = species, Sex = Sex,                         Ind_ID = Ind_ID, group_day = group_day, date = date, Time = Time,
+                    datetime = datetime, activity = Activity_1, season = season,
+                    crs = "WGS84")
+```
+
+**Transform coordinates using a projected CRS, UTM38S for Madagascar (https://epsg.io/29738)**
+
+```{r}
+trck.all <- transform_coords(trck.all, 29738)
+```
+
+### KDE home range estimation (95%)
+Remove duplicates before doing the analyses
+
+Create a template raster for KDE
+
+```{r}
+trast <- make_trast(trck.all)
+trast
+```
+
+#### Overall KDE calculation
+
+Separate the track file by lemur species
+
+```{r}
+trck.rubri <- trck.all[trck.all$species == "Eulemur rubriventer", ]
+trck.rufi <- trck.all[trck.all$species == "Eulemur rufifrons", ]
+trck.varecia <- trck.all[trck.all$species == "Varecia variegata editorum", ]
+```
+
+KDE calculation
+
+```{r}
+# E. rubriventer
+hr_rubri <- hr_kde(trck.rubri, trast = trast, levels = 0.95)
+hr_area(hr_rubri, units = TRUE)
+
+# E. rufifrons
+hr_rufi <- hr_kde(trck.rufi, trast = trast, levels = 0.95)
+hr_area(hr_rufi, units = TRUE)
+
+# Varecia
+hr_var <- hr_kde(trck.varecia, trast = trast, levels = 0.95)
+hr_area(hr_var, units = TRUE)
+```
+
+#### Seasonal KDE
+
+Separate the track file by lemur species and season
+
+```{r}
+# Wet season
+trck.rubri.wet <- trck.all[trck.all$species == "Eulemur rubriventer" 
+                         & trck.all$season == "Wet", ]
+trck.rufi.wet <- trck.all[trck.all$species == "Eulemur rufifrons" 
+                         & trck.all$season == "Wet", ]
+trck.var.wet <- trck.all[trck.all$species == "Varecia variegata editorum" 
+                         & trck.all$season == "Wet", ]
+
+# Dry season
+trck.rubri.dry <- trck.all[trck.all$species == "Eulemur rubriventer" 
+                         & trck.all$season == "Dry", ]
+trck.rufi.dry <- trck.all[trck.all$species == "Eulemur rufifrons" 
+                         & trck.all$season == "Dry", ]
+trck.var.dry <- trck.all[trck.all$species == "Varecia variegata editorum" 
+                         & trck.all$season == "Dry", ]
+```
+
+KDE calculation
+
+```{r}
+### WET
+# E. rubriventer
+hr_rubri_wet <- hr_kde(trck.rubri.wet, trast = trast, levels = 0.95)
+hr_area(hr_rubri_wet, units = TRUE)
+
+# E. rufifrons
+hr_rufi_wet <- hr_kde(trck.rufi.wet, trast = trast, levels = 0.95)
+hr_area(hr_rufi_wet, units = TRUE)
+
+# Varecia
+hr_var_wet <- hr_kde(trck.var.wet, trast = trast, levels = 0.95)
+hr_area(hr_var_wet, units = TRUE)
+
+### DRY
+# E. rubriventer
+hr_rubri_dry <- hr_kde(trck.rubri.dry, trast = trast, levels = 0.95)
+hr_area(hr_rubri_dry, units = TRUE)
+
+# E. rufifrons
+hr_rufi_dry <- hr_kde(trck.rufi.dry, trast = trast, levels = 0.95)
+hr_area(hr_rufi_dry, units = TRUE)
+
+# Varecia
+hr_var_dry <- hr_kde(trck.var.dry, trast = trast, levels = 0.95)
+hr_area(hr_var_dry, units = TRUE)
+```
+
+## Main route behavioral distribution in space
+
+```{r}
+df_routes <- df_BHV_clean %>%
+  mutate(
+    behavior = case_when(
+      Activity_1 == "F" ~ "Feeding",
+      Activity_1 == "R" ~ "Resting",
+      Activity_1 == "SL" ~ "Sleeping",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(behavior))
+```
+
+```{r}
+df_routes <- df_routes %>%
+  group_by(Ind_ID) %>%
+  mutate(
+    next_lon = lead(longitude),
+    next_lat = lead(latitude),
+    next_behavior = lead(behavior)
+  ) %>%
+  filter(!is.na(next_lon))
+```
+
+```{r}
+best_days <- df_routes %>%
+  mutate(date = as.Date(datetime)) %>%
+  dplyr::group_by(species, date) %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  arrange(desc(n)) %>%
+  dplyr::group_by(species) %>%
+  slice(1) %>%
+  ungroup()
+```
+
+```{r}
+df_example <- df_routes %>%
+  mutate(date = as.Date(datetime)) %>%
+  inner_join(best_days, by = c("species", "date"))
+```
+
+```{r}
+routes_FR <- df_example %>%
+  filter(behavior %in% c("Feeding", "Resting") |
+         next_behavior %in% c("Feeding", "Resting"))
+```
+
+```{r}
+library(ggplot2)
+
+ggplot() +
+
+  # movement routes (slightly lighter for readability)
+  geom_segment(
+    data = routes_FR,
+    aes(
+      x = longitude,
+      y = latitude,
+      xend = next_lon,
+      yend = next_lat
+    ),
+    arrow = arrow(length = unit(0.18, "cm")),
+    alpha = 0.35,
+    color = "grey50",
+    linewidth = 0.4
+  ) +
+
+  # behavior points (clear and color-blind friendly)
+  geom_point(
+    data = routes_FR,
+    aes(
+      x = longitude,
+      y = latitude,
+      color = behavior
+    ),
+    size = 2.2,
+    alpha = 0.9
+  ) +
+
+  # species panels
+  facet_wrap(~species, scales = "free") +
+
+  # better color palette
+  scale_color_brewer(palette = "Set1") +
+
+  # clean theme
+  theme_bw(base_size = 12) +
+
+  theme(
+
+    # centered title
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+
+    # cleaner grid
+    panel.grid.major = element_line(color = "grey90"),
+    panel.grid.minor = element_blank(),
+
+    # clearer facet labels
+    strip.text = element_text(face = "bold"),
+
+    # legend positioning
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+
+    # improve spacing
+    plot.margin = margin(10, 10, 10, 10)
+  ) +
+
+  labs(
+    title = "Species-specific daily movement routes between feeding and resting sites",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Behavior"
+  )
+```
+
+## Key feeding, resting and sleeping tree
+
+```{r}
+# Create readable behavior names
+df_space <- df_BHV_clean %>%
+  mutate(
+    behavior = case_when(
+      Activity_1 == "F"  ~ "Feeding",
+      Activity_1 == "T"  ~ "Traveling",
+      Activity_1 == "SL" ~ "Sleeping",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+```{r}
+df_sf <- st_as_sf(
+  df_space,
+  coords = c("longitude", "latitude"),
+  crs = 4326
+)
+
+# Transform to UTM Madagascar
+df_sf <- st_transform(df_sf, 29738)
+```
+
+```{r}
+feeding <- df_space %>%
+  filter(behavior == "Feeding")
+```
+
+### Do species overlap in feeding, resting, sleeping and traveling areas?
+
+```{r}
+df_space_clean <- df_space %>%
+  filter(!is.na(behavior))
+
+ggplot(df_space_clean,
+       aes(x = longitude,
+           y = latitude)) +
+  stat_density_2d(
+    aes(fill = species),
+    geom = "polygon",
+    alpha = 0.3,
+    color = NA
+  ) +
+  facet_wrap(~behavior) +
+  theme_bw()
+```
+
+### Do behavior accur in the same area for each species?
+
+```{r}
+ggplot(df_space_clean,
+       aes(x = longitude,
+           y = latitude)) +
+  stat_density_2d(
+    aes(fill = behavior),
+    geom = "polygon",
+    alpha = 0.3,
+    color = NA
+  ) +
+  facet_wrap(~species) +
+  theme_bw()
+```
+
+
+```{r}
+feeding_follow <- df_FLW_clean %>%
+  filter(event == "F")
+```
+
+```{r}
+feeding_follow <- feeding_follow %>%
+  mutate(
+    latitude = as.numeric(latitude),
+    longitude = as.numeric(longitude),
+    DBH = as.numeric(DBH),
+    RFR = as.numeric(RFR),
+    UFR = as.numeric(UFR),
+    FL = as.numeric(FL),
+    YL = as.numeric(YL)
+  )
+```
+
+```{r}
+plant_use_species <- feeding_follow %>%
+  dplyr::group_by(species, plant_species) %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  dplyr::group_by(species) %>%
+  dplyr::arrange(desc(n), .by_group = TRUE)
+```
+
+```{r}
+top_plants <- plant_use_species %>%
+  group_by(species) %>%
+  slice_max(n, n = 10)
+
+ggplot(top_plants,
+       aes(x = reorder(plant_species, n),
+           y = n,
+           fill = species)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~species,
+             scales = "free") +
+  theme_bw()
+```
+
