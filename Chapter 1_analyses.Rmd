@@ -1179,8 +1179,6 @@ routes_FR <- df_example %>%
 ```
 
 ```{r}
-library(ggplot2)
-
 ggplot() +
 
   # movement routes (slightly lighter for readability)
